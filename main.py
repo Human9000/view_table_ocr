@@ -1,0 +1,260 @@
+import os
+import cv2 as cv
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from paddleocr import PaddleOCR
+import matplotlib
+
+matplotlib.use('TkAgg')
+ocr_engine = PaddleOCR(use_angle_cls=True, lang="ch", page_num=1, show_log=False)
+
+DEBUG = True
+LOG = True
+
+
+def mean01_dim(img, dim=0, left=0, right=1):
+    d = img.shape[dim]
+    lr = [int(d * left), int(d * right)]
+    _, x, _ = np.split(img, indices_or_sections=lr, axis=dim)
+    x = x.mean(axis=dim)
+    x = x - x.min()
+    x = x / x.max()
+    return x
+
+
+def min01_dim(img, dim=0, left=0, right=1):
+    d = img.shape[dim]
+    lr = [int(d * left), int(d * right)]
+    _, x, _ = np.split(img, indices_or_sections=lr, axis=dim)
+    x = x.min(axis=dim)
+    x = x - x.min()
+    x = x / x.max()
+    return x
+
+
+def show_img(img):
+    plt.imshow(img, cmap='gray')
+    plt.show()
+
+
+def split_head_body(img):
+    assert len(img.shape) == 2, "img must only have 2 dims"
+    # 裁剪到上边
+    x = mean01_dim(img, dim=-1, left=0.5, right=0.70)
+    index = np.where(x < 0.6)[0]
+
+    w0 = index[0]
+    w2 = index[-1]
+    w1 = w0
+    for i in range(len(index)):
+        if index[-i] - index[-i - 1] > 100:
+            w1 = index[-i - 1]
+            break
+    assert w1 != w0, "head not found: w1 != w0"
+    if DEBUG and True:
+        plt.plot(x)
+        plt.axvline(x=w0, linestyle='--', color='r')
+        plt.axvline(x=w1, linestyle='--', color='r')
+        plt.axvline(x=w2, linestyle='--', color='r')
+        plt.show()
+        plt.imshow(img)
+        plt.axhline(y=w0, linestyle='--', color='r')
+        plt.axhline(y=w1, linestyle='--', color='r')
+        plt.axhline(y=w2, linestyle='--', color='r')
+        plt.show()
+    return w0, w1, w2
+
+
+def split_col(head):
+    w = head.shape[0]
+    h = head.shape[1]
+    head = head.mean(axis=-1)
+    head = cv.blur(head, (3, 3)).astype(np.uint8)
+    retVal, _ = cv.threshold(head[:, int(h * 0.3):int(h * 0.8)],
+                             0,
+                             255,
+                             cv.THRESH_OTSU)
+    head = (head > retVal).astype(np.uint8)
+    # head = cv.dilate(head, np.ones((3, 3), np.uint8))
+    # head = cv.erode(head, np.ones((5, 5), np.uint8))
+
+    # 定义膨胀操作的结构元素
+    mid = []
+    head1 = head[int(w * 0.33):int(w * 0.60)]
+    head2 = head[int(w * 0.80):int(w * 0.88)]
+    x = min01_dim(cv.erode(head1, np.ones((21, 21), np.uint8), ),
+                  0)
+
+    if DEBUG:
+        plt.imshow(head)
+        # for i in mid:
+        #     plt.axvline(i, color='r')
+        plt.show()
+    l = -1
+    r = -1
+    rr = -1
+    for i in range(400, 100, -1):
+        if x[i] < 0.5 < x[i + 1]:
+            r = i
+            break
+    for i in range(400, 100, -1):
+        if x[i] > 0.5 > x[i + 1]:
+            l = i
+            break
+    for i in range(h - 1, h - 800, -1):
+        if x[i] < 0.5 < x[i + 1]:
+            rr = i
+            break
+    mid.append(l)
+    mid.append(r)
+
+    x = min01_dim(cv.erode(head2, np.ones((21, 21), np.uint8), ), 0)
+
+    l = []
+    r = []
+    for i in range(700, len(x) - 1):
+        if x[i] < 0.5 < x[i + 1]:
+            r.append(i)
+        if x[i] > 0.5 > x[i + 1]:
+            l.append(i)
+    d = int((l[1] - r[0]) * 0.45)  # 第一列
+    mid.append(l[0] - d)
+    for i in range(len(r) - 1):
+        mid.append(r[i] + d)
+        d = l[i + 1] - mid[-1]
+    mid.append(r[-1] + d)
+    if rr - mid[-1] > 50:
+        mid.append(rr)
+    if DEBUG:
+        plt.imshow(head)
+        for i in mid:
+            plt.axvline(i, color='r')
+        plt.show()
+    return mid
+
+
+def split_row(id_rol):
+    id_rol = id_rol.mean(-1)
+    id_rol = cv.blur(id_rol, (3, 3)).astype(np.uint8)
+    retVal, id_rol = cv.threshold(id_rol,
+                                  0,
+                                  255,
+                                  cv.THRESH_OTSU)
+    id_rol[:10] = 255
+    id_rol[-10:] = 255
+    # id_rol = cv.dilate(id_rol, np.ones((3, 3), np.uint8))
+    # x = 0
+    # for i in range(12):
+    #     x += min01_dim(cv.erode(id_rol, np.ones((21, 21), np.uint8)),
+    #                    1, left=i / 20, right=i / 20 + 0.05) / 12
+    x = mean01_dim(cv.erode(id_rol, np.ones((7, 7), np.uint8)),
+                   1, left=0, right=1)
+
+    xdiff = np.diff(x)
+    xdiff[xdiff < -0.4] = -0.4
+    xdiff[xdiff > 0] = 0
+    # 非极小值抑制，r = 70
+    mask = np.zeros_like(xdiff)
+    for i in range(len(xdiff)):
+        l = i-70 if i-70 > 0 else 0
+        r = i+70 if i+70 < len(xdiff) else len(xdiff)
+        min_ = xdiff[l:r].min()
+        if xdiff[i] == min_:
+            mask[i] = 1
+
+    index = np.where(mask>0)[0]
+
+    res = [i-10 for i in index]
+
+    if DEBUG:
+        plt.imshow(id_rol)
+        for i in res:
+            plt.axhline(i, color='r')
+        plt.show()
+    return res
+
+
+def table_struct(img,page):
+    try:
+        i0, i1, i2 = split_head_body(img.mean(axis=-1))  # 输入灰度图
+        assert (i0 < i1 < 700 < i2 and i1 - i0 > 150 and i2 - i1 > 50), \
+            'head is not found: (i0 < i1 < 700 < i2 and i1 - i0 > 150 and i2 - i1 > 50)'
+    except Exception as e:
+        print("Error:", e)
+        if DEBUG:
+            plt.imshow(img)
+            plt.show()
+        return False
+    cols = split_col(img[i0:i1])
+    print("----\t", len(cols))
+
+    rows = split_row(img[i1:i2, cols[0]:cols[1]])
+    rows = [i + i1 - 2 for i in rows]
+    if LOG:
+        fig = plt.figure()
+        plt.imshow(img)
+        for i in range(len(cols)):
+            plt.axvline(x=cols[i], linestyle='--', color='r')
+        for i in [i0, i1, i2]:
+            plt.axhline(y=i, linestyle='--', color='r')
+        for i in rows:
+            plt.axhline(y=i, linestyle='--', color='g')
+        fig.savefig(f'log/{page}.png')
+        cv.imwrite(f'log2/{page}.jpg', img)
+        if DEBUG:
+            plt.show()
+        plt.close(fig)
+    return [[i0, i1, i2], cols, rows]
+
+
+def ocr(img):
+    result = ""
+    res = ocr_engine(img)
+    # print(res[1])
+    if len(res[1]) > 0:
+        for r in res[1]:
+            result += r[0]
+
+    return result
+
+
+def cv2_imread(filepath):
+    cv2_img = cv.imdecode(np.fromfile(filepath, dtype=np.uint8), -1)
+    return cv2_img
+
+
+if __name__ == '__main__':
+    save_folder = './output'
+    root = r"E:\Seafile\07-参考文献\第二册"
+    for i in os.listdir(root):
+        path = root + "\\" + i
+        if not i.endswith('.png'):
+            continue
+        page = int(i[:-4].split('_')[-1])
+        print(page, end='\t')
+        if page < 99 or page > 99:
+            continue
+        if page < 53 or \
+                page > 213:
+            continue
+        print(page, end='\t')
+        img = cv2_imread(path)  # 输入的图片是调整后方向的图片，高*宽*3
+        if img.shape[0] > img.shape[1]:
+            img = img.transpose(1, 0, 2)[:, ::-1, :]
+        res = table_struct(img,page)
+        if not res:
+            print("Error")
+            continue
+        [i0, i1, i2], cols, rows = res
+        print(cols)
+        rows.append(i2)
+        n, m = len(cols) - 1, len(rows) - 1
+        data_result = [[""] * n for _ in range(m)]
+        for r in range(m):
+            for c in range(n):
+                item = img[rows[r]:rows[r + 1], cols[c]:cols[c + 1]]
+                data_result[r][c] = ocr(item)
+        df = pd.DataFrame(data_result)
+        df.to_csv(f"o2/{page}.tsv", index=False, sep='\t')
+        print(df)
